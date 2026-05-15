@@ -1,3 +1,4 @@
+from pathlib import Path
 class Config:
     """
     超参数配置文件，包含小样本和大样本两套参数。

@@ -2,3 +2,5 @@ VOC*
 experiments/
 runas/
 .gitignore
+photos/
+runs/
