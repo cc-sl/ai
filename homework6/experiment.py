@@ -35,7 +35,8 @@ class Config:
         'epochs': 50,
         'batch': 4,                  # MX450 2GB 建议 batch=4
         'imgsz': 640,
-        'lr0': 0.01,                 # 初始学习率
+        #'lr0': 0.01,                 # 初始学习率
+        'lr0': 0.001,
         'optimizer': 'SGD',
         'weight_decay': 0.0005,
         'momentum': 0.937,
@@ -272,11 +273,17 @@ def convert_voc_to_yolo(voc_dir, yolo_dir, small_mode=True, num_samples=300):
     return str(Path(yolo_dir).absolute())
 
 # -------------------------- 训练与评估 --------------------------
-def train_model(data_yaml, weights, run_name, hyperparams, resume=False):
+import os
+from ultralytics import YOLO  # 确保导入依赖
+
+
+def train_model(data_yaml, weights, run_name, hyperparams, resume=False, retry_with_lower_lr=True):
     """
     通用训练函数，支持混合精度、自动保存及断点续训。
+    新增：NaN损失自动检测 + 学习率自动降级重试
     返回训练好的模型对象。
     """
+    # 保留你原始的所有打印日志（功能不变）
     print(f"\n{'='*40}")
     print(f"开始训练: {run_name}")
     print(f"数据集: {data_yaml}")
@@ -284,32 +291,54 @@ def train_model(data_yaml, weights, run_name, hyperparams, resume=False):
     print(f"超参数: {hyperparams}")
     print(f"Resume: {resume}")
 
-    model = YOLO(weights) if weights else YOLO('yolo11n.pt')  # 默认使用 n 版本
+    try:
+        # 模型初始化（和你原来完全一致）
+        model = YOLO(weights) if weights else YOLO('yolo11n.pt')
 
-    # 训练参数
-    results = model.train(
-        data=data_yaml,
-        epochs=hyperparams['epochs'],
-        batch=hyperparams['batch'],
-        imgsz=hyperparams['imgsz'],
-        lr0=hyperparams['lr0'],
-        optimizer=hyperparams['optimizer'],
-        weight_decay=hyperparams['weight_decay'],
-        momentum=hyperparams['momentum'],
-        warmup_epochs=hyperparams['warmup_epochs'],
-        amp=hyperparams['amp'],
-        workers=hyperparams['workers'],
-        # 如果启用数据增强，传入增强参数
-        **{k: v for k, v in hyperparams.items() if k in ['hsv_h', 'hsv_s', 'hsv_v',
-                                                         'degrees', 'translate', 'scale',
-                                                         'shear', 'flipud', 'fliplr',
-                                                         'mosaic', 'erasing']},
-        resume=resume,
-        project='runs/train',
-        name=run_name,
-        exist_ok=True
-    )
-    return model
+        # 训练参数（完整保留你原来的所有参数 + 数据增强透传）
+        results = model.train(
+            data=data_yaml,
+            epochs=hyperparams['epochs'],
+            batch=hyperparams['batch'],
+            imgsz=hyperparams['imgsz'],
+            lr0=hyperparams['lr0'],
+            optimizer=hyperparams['optimizer'],
+            weight_decay=hyperparams['weight_decay'],
+            momentum=hyperparams['momentum'],
+            warmup_epochs=hyperparams['warmup_epochs'],
+            amp=hyperparams['amp'],
+            workers=hyperparams['workers'],
+            # 完整保留数据增强参数透传（核心原有功能）
+            **{k: v for k, v in hyperparams.items() if k in ['hsv_h', 'hsv_s', 'hsv_v',
+                                                             'degrees', 'translate', 'scale',
+                                                             'shear', 'flipud', 'fliplr',
+                                                             'mosaic', 'erasing']},
+            resume=resume,
+            project='runs/train',
+            name=run_name,
+            exist_ok=True
+        )
+
+        # 检查模型是否正常保存（新增健壮性判断）
+        last_pt = f"runs/train/{run_name}/weights/last.pt"
+        if not os.path.exists(last_pt):
+            raise FileNotFoundError(f"训练未保存任何检查点，请检查是否有NaN损失。")
+        
+        print(f"\n训练完成！模型已保存至: {last_pt}")
+        return model
+
+    # 捕获异常 + 自动降级学习率重试（新增功能）
+    except FileNotFoundError as e:
+        print(f"训练失败: {e}")
+        if retry_with_lower_lr and hyperparams['lr0'] > 1e-4:
+            new_lr = hyperparams['lr0'] / 10
+            print(f"自动降低学习率至 {new_lr} 并重新训练...")
+            new_hyper = hyperparams.copy()
+            new_hyper['lr0'] = new_lr
+            # 递归重试，关闭重复重试避免死循环
+            return train_model(data_yaml, weights, run_name + "_retry", new_hyper, resume=False, retry_with_lower_lr=False)
+        else:
+            raise RuntimeError("训练因 NaN 损失而终止，无法保存模型。请检查数据集标签是否正确、学习率是否过高。")
 
 def evaluate_model(model, data_yaml, iou_thresholds=None, save_txt=True):
     """
