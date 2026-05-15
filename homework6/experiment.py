@@ -45,7 +45,6 @@ class Config:
     #     'workers': 4,
     #     'data_augment': 'default',   # 使用默认增强
     # }
-
     SMALL_SAMPLE = {
         'num_samples': 300,
         'epochs': 50,
@@ -295,23 +294,11 @@ from ultralytics import YOLO  # 确保导入依赖
 
 def train_model(data_yaml, weights, run_name, hyperparams, resume=False, retry_with_lower_lr=True):
     """
-    通用训练函数，支持混合精度、自动保存及断点续训。
-    新增：NaN损失自动检测 + 学习率自动降级重试
-    返回训练好的模型对象。
+    通用训练函数。返回 (model, save_dir)。
     """
-    # 保留你原始的所有打印日志（功能不变）
-    print(f"\n{'='*40}")
-    print(f"开始训练: {run_name}")
-    print(f"数据集: {data_yaml}")
-    print(f"预训练权重: {weights}")
-    print(f"超参数: {hyperparams}")
-    print(f"Resume: {resume}")
-
     try:
-        # 模型初始化（和你原来完全一致）
         model = YOLO(weights) if weights else YOLO('yolo11n.pt')
 
-        # 训练参数（完整保留你原来的所有参数 + 数据增强透传）
         results = model.train(
             data=data_yaml,
             epochs=hyperparams['epochs'],
@@ -324,37 +311,40 @@ def train_model(data_yaml, weights, run_name, hyperparams, resume=False, retry_w
             warmup_epochs=hyperparams['warmup_epochs'],
             amp=hyperparams['amp'],
             workers=hyperparams['workers'],
-            # 完整保留数据增强参数透传（核心原有功能）
-            **{k: v for k, v in hyperparams.items() if k in ['hsv_h', 'hsv_s', 'hsv_v',
-                                                             'degrees', 'translate', 'scale',
-                                                             'shear', 'flipud', 'fliplr',
-                                                             'mosaic', 'erasing']},
             resume=resume,
-            project='runs/train',
+            project='runs/train',          # 保持原设置
             name=run_name,
-            exist_ok=True
+            exist_ok=True,
+            plots=False,                    # ★ 关闭验证时绘图，避免 OverflowError
         )
 
-        # 检查模型是否正常保存（新增健壮性判断）
-        last_pt = f"runs/train/{run_name}/weights/last.pt"
-        if not os.path.exists(last_pt):
-            raise FileNotFoundError(f"训练未保存任何检查点，请检查是否有NaN损失。")
-        
-        print(f"\n训练完成！模型已保存至: {last_pt}")
+        # ★ 使用 ultralytics 实际保存的目录，而不是自己拼接
+        save_dir = Path(results.save_dir)
+        last_pt = save_dir / "weights" / "last.pt"
+        best_pt = save_dir / "weights" / "best.pt"
+
+        if not last_pt.exists() and not best_pt.exists():
+            raise FileNotFoundError(
+                f"训练未生成检查点。\n"
+                f"  期望路径: {last_pt}\n"
+                f"  实际目录内容: {list((save_dir / 'weights').glob('*')) if (save_dir / 'weights').exists() else 'weights目录不存在'}"
+            )
+
+        print(f"✓ 训练完成，模型保存至: {save_dir}")
         return model
 
-    # 捕获异常 + 自动降级学习率重试（新增功能）
     except FileNotFoundError as e:
         print(f"训练失败: {e}")
-        if retry_with_lower_lr and hyperparams['lr0'] > 1e-4:
+        if retry_with_lower_lr and hyperparams.get('lr0', 0.01) > 1e-4:
             new_lr = hyperparams['lr0'] / 10
             print(f"自动降低学习率至 {new_lr} 并重新训练...")
             new_hyper = hyperparams.copy()
             new_hyper['lr0'] = new_lr
-            # 递归重试，关闭重复重试避免死循环
-            return train_model(data_yaml, weights, run_name + "_retry", new_hyper, resume=False, retry_with_lower_lr=False)
+            # ★ 重试时用新名称，避免覆盖
+            return train_model(data_yaml, weights, run_name + "_lr" + str(new_lr),
+                               new_hyper, resume=False, retry_with_lower_lr=False)
         else:
-            raise RuntimeError("训练因 NaN 损失而终止，无法保存模型。请检查数据集标签是否正确、学习率是否过高。")
+            raise RuntimeError("训练因异常终止，无法保存模型。请检查数据集标签是否正确、学习率是否过高。")
 
 def evaluate_model(model, data_yaml, iou_thresholds=None, save_txt=True):
     """
