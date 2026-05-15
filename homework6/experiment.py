@@ -209,10 +209,11 @@ def train_model(data_yaml, weights, run_name, hyperparams, resume=False, retry_w
             amp=hyperparams['amp'],
             workers=hyperparams['workers'],
             resume=resume,
-            project='runs/train',          # 保持原设置
+            project='runs/train',
+            patience=10,
             name=run_name,
             exist_ok=True,
-            plots=False,                    #  关闭验证时绘图，避免 OverflowError
+            plots=False,
         )
 
         #  使用 ultralytics 实际保存的目录，而不是自己拼接
