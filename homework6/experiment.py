@@ -45,18 +45,33 @@ class Config:
     #     'workers': 4,
     #     'data_augment': 'default',   # 使用默认增强
     # }
+    # SMALL_SAMPLE = {
+    #     'num_samples': 300,
+    #     'epochs': 50,
+    #     'batch': 4,          # 可尝试保持
+    #     'imgsz': 416,        # 关键降低
+    #     'lr0': 0.001,        # 降低学习率
+    #     'optimizer': 'SGD',
+    #     'weight_decay': 0.0005,
+    #     'momentum': 0.937,
+    #     'warmup_epochs': 3,
+    #     'amp': True,
+    #     'workers': 1,        # 减少内存压力
+    #     'data_augment': 'default',
+    # }
+
     SMALL_SAMPLE = {
         'num_samples': 300,
-        'epochs': 50,
-        'batch': 4,          # 可尝试保持
-        'imgsz': 416,        # 关键降低
-        'lr0': 0.001,        # 降低学习率
-        'optimizer': 'SGD',
+        'epochs': 30,           #  50 → 30
+        'batch': 8,             #  4 → 8（配合更小 imgsz）
+        'imgsz': 320,           #  416 → 320
+        'lr0': 0.001,
+        'optimizer': 'AdamW',   #  SGD → AdamW，小数据集收敛更快
         'weight_decay': 0.0005,
         'momentum': 0.937,
-        'warmup_epochs': 3,
+        'warmup_epochs': 2,     #  3 → 2
         'amp': True,
-        'workers': 1,        # 减少内存压力
+        'workers': 2,           #  1 → 2
         'data_augment': 'default',
     }
 
@@ -315,10 +330,10 @@ def train_model(data_yaml, weights, run_name, hyperparams, resume=False, retry_w
             project='runs/train',          # 保持原设置
             name=run_name,
             exist_ok=True,
-            plots=False,                    # ★ 关闭验证时绘图，避免 OverflowError
+            plots=False,                    #  关闭验证时绘图，避免 OverflowError
         )
 
-        # ★ 使用 ultralytics 实际保存的目录，而不是自己拼接
+        #  使用 ultralytics 实际保存的目录，而不是自己拼接
         save_dir = Path(results.save_dir)
         last_pt = save_dir / "weights" / "last.pt"
         best_pt = save_dir / "weights" / "best.pt"
@@ -340,7 +355,7 @@ def train_model(data_yaml, weights, run_name, hyperparams, resume=False, retry_w
             print(f"自动降低学习率至 {new_lr} 并重新训练...")
             new_hyper = hyperparams.copy()
             new_hyper['lr0'] = new_lr
-            # ★ 重试时用新名称，避免覆盖
+            #  重试时用新名称，避免覆盖
             return train_model(data_yaml, weights, run_name + "_lr" + str(new_lr),
                                new_hyper, resume=False, retry_with_lower_lr=False)
         else:
