@@ -1,391 +1,516 @@
+#!/usr/bin/env python3
+"""
+YOLOv11 目标检测实验全流程脚本
+环境：Python 3.12, PyTorch 2.x, CUDA 11.8, 单GPU (NVIDIA MX450 2GB)
+数据集：PASCAL VOC 2007，位于 ./VOCdevkit
+预训练权重：./yolo11n.pt
+"""
+
 import os
-import shutil
+import sys
+import yaml
 import random
-import xml.etree.ElementTree as ET
+import shutil
+import numpy as np
 import cv2
 import matplotlib.pyplot as plt
-import yaml
 from pathlib import Path
-from ultralytics import YOLO
+from typing import Dict, List, Tuple
+
 import torch
+from ultralytics import YOLO
 
-# ================= 1. 全局配置与超参数 =================
-# 路径配置
-VOC_ROOT = r"VOCdevkit\VOC2007"
-YOLO_DATASET_ROOT = r"VOC_YOLO"
-EXPERIMENT_ROOT = r"Experiments"
-
-# 硬件与基础超参数 (针对2GB显存优化)
-IMGSZ = 320          # 降低分辨率以适应2G显存 (原640会OOM)
-BATCH_SIZE = 4       # 小显存需设置极小batch
-DEVICE = 0 if torch.cuda.is_available() else 'cpu'   # 自动检测GPU
-AMP = True           # 开启混合精度训练，必须开启以防OOM
-
-# 实验超参数
-EPOCHS_BASE = 50     # 基础训练轮数
-LR_BASE = 0.01       # 初始学习率
-
-# VOC的20个类别
-VOC_CLASSES = ['aeroplane', 'bicycle', 'bird', 'boat', 'bottle', 'bus', 'car', 'cat',
-               'chair', 'cow', 'diningtable', 'dog', 'horse', 'motorbike', 'person',
-               'pottedplant', 'sheep', 'sofa', 'train', 'tvmonitor']
-
-# ================= 2. 数据预处理：VOC转YOLO格式 =================
-def convert_voc_to_yolo(voc_root, yolo_root):
-    """将VOC格式转换为YOLO格式，并生成对应的txt标签文件"""
-    print("开始转换VOC到YOLO格式...")
-    dirs = {
-        'trainval': os.path.join(voc_root, 'ImageSets', 'Main', 'trainval.txt'),
-        'test': os.path.join(voc_root, 'ImageSets', 'Main', 'test.txt')
+# -------------------------- 配置文件 --------------------------
+class Config:
+    """
+    超参数配置文件，包含小样本和大样本两套参数。
+    用户可根据实际显存修改 batch size 和图像尺寸。
+    """
+    # 基础路径
+    DEVKIT_PATH = Path("./VOCdevkit")
+    WEIGHTS_PATH = Path("./yolo11n.pt")
+    # 小样本参数（最大 2GB 显存）
+    SMALL_SAMPLE = {
+        'num_samples': 300,          # 抽取 300 张作为训练集
+        'epochs': 50,
+        'batch': 4,                  # MX450 2GB 建议 batch=4
+        'imgsz': 640,
+        'lr0': 0.01,                 # 初始学习率
+        'optimizer': 'SGD',
+        'weight_decay': 0.0005,
+        'momentum': 0.937,
+        'warmup_epochs': 3,
+        'amp': True,                 # 混合精度训练
+        'workers': 4,
+        'data_augment': 'default',   # 使用默认增强
+    }
+    # 大样本参数（此处假设另外有 6GB 显存可用，实际若显存不足会 OOM）
+    LARGE_SAMPLE = {
+        'epochs': 100,
+        'batch': 8,                  # 6GB 显存可适当调大
+        'imgsz': 640,
+        'lr0': 0.01,
+        'optimizer': 'SGD',
+        'weight_decay': 0.0005,
+        'momentum': 0.937,
+        'warmup_epochs': 3,
+        'amp': True,
+        'workers': 4,
+        'data_augment': 'default',
+    }
+    # 数据增强对比实验参数
+    AUGMENT_SETTINGS = {
+        'none': {
+            'hsv_h': 0.0, 'hsv_s': 0.0, 'hsv_v': 0.0,
+            'degrees': 0.0, 'translate': 0.0, 'scale': 0.0,
+            'shear': 0.0, 'flipud': 0.0, 'fliplr': 0.0,
+            'mosaic': 0.0, 'erasing': 0.0
+        },
+        'light': {
+            'hsv_h': 0.015, 'hsv_s': 0.7, 'hsv_v': 0.4,
+            'degrees': 0.0, 'translate': 0.1, 'scale': 0.5,
+            'shear': 0.0, 'flipud': 0.0, 'fliplr': 0.5,
+            'mosaic': 0.5, 'erasing': 0.0
+        },
+        'heavy': {
+            'hsv_h': 0.03, 'hsv_s': 1.0, 'hsv_v': 0.8,
+            'degrees': 30.0, 'translate': 0.3, 'scale': 0.9,
+            'shear': 10.0, 'flipud': 0.5, 'fliplr': 0.5,
+            'mosaic': 1.0, 'erasing': 0.4
+        }
+    }
+    # IoU 阈值列表（用于评估对比）
+    IOU_THRESHOLDS = [0.3, 0.5, 0.7]
+    # 模型对比实验（需提前下载对应的预训练权重）
+    MODEL_PATHS = {
+        'yolov11n': './yolo11n.pt',
+        'yolov11s': './yolo11s.pt',   # 用户需自行下载
+        'yolov11m': './yolo11m.pt'
     }
 
-    for phase, txt_file in dirs.items():
-        if not os.path.exists(txt_file):
-            print(f"找不到 {txt_file}，请检查VOC数据集路径！")
-            return
+config = Config()
 
-        with open(txt_file, 'r') as f:
-            image_ids = [line.strip() for line in f.readlines()]
+# -------------------------- 工具函数 --------------------------
+def setup_directories():
+    """创建结果保存目录"""
+    dirs = ['runs', 'outputs', 'plots']
+    for d in dirs:
+        os.makedirs(d, exist_ok=True)
 
-        # 创建YOLO目录结构
-        img_out_dir = os.path.join(yolo_root, 'images', phase)
-        label_out_dir = os.path.join(yolo_root, 'labels', phase)
-        os.makedirs(img_out_dir, exist_ok=True)
-        os.makedirs(label_out_dir, exist_ok=True)
+def set_seed(seed=42):
+    """固定随机种子"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
 
-        for img_id in image_ids:
-            # 读取XML
-            xml_path = os.path.join(voc_root, 'Annotations', f'{img_id}.xml')
-            if not os.path.exists(xml_path):
+def check_gpu_memory():
+    """检查 GPU 显存并返回可用显存（GB）"""
+    if torch.cuda.is_available():
+        total_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"GPU 显存总量: {total_mem:.2f} GB")
+        return total_mem
+
+def check_file_exists(filepath, description):
+    """检查文件是否存在，若存在则返回 True，否则打印提示"""
+    if os.path.exists(filepath):
+        print(f"✓ {description} 已存在: {filepath}")
+        return True
+    else:
+        print(f"✗ {description} 不存在: {filepath}")
+        return False
+
+# -------------------------- 数据集预处理 --------------------------
+def convert_voc_to_yolo(voc_dir, yolo_dir, small_mode=True, num_samples=300):
+    """
+    将 VOC 格式标注转换为 YOLO 格式，并创建 dataset.yaml。
+    同时为小样本模式从 trainval 中随机抽取指定数量的图像。
+    voc_dir: VOCdevkit 的上级路径（如 ./VOCdevkit/VOC2007）
+    yolo_dir: 输出 YOLO 格式数据集的根目录
+    small_mode: 是否启用小样本抽取
+    num_samples: 小样本训练集图像数量
+    """
+    if os.path.exists(yolo_dir) and os.path.exists(os.path.join(yolo_dir, "dataset.yaml")):
+        print(f"YOLO 数据集已存在，跳过转换: {yolo_dir}")
+        return yolo_dir
+
+    voc_path = Path(voc_dir) / "VOC2007"
+    if not voc_path.exists():
+        raise FileNotFoundError(f"VOC 数据集未找到: {voc_path}")
+
+    # 解析类别名称
+    classes = [
+        "aeroplane", "bicycle", "bird", "boat", "bottle",
+        "bus", "car", "cat", "chair", "cow",
+        "diningtable", "dog", "horse", "motorbike", "person",
+        "pottedplant", "sheep", "sofa", "train", "tvmonitor"
+    ]
+    class_to_id = {name: idx for idx, name in enumerate(classes)}
+
+    # 读取官方划分
+    def read_image_set(split):
+        split_file = voc_path / "ImageSets" / "Main" / f"{split}.txt"
+        if not split_file.exists():
+            raise FileNotFoundError(f"找不到 {split}.txt，请检查数据集结构")
+        with open(split_file, 'r') as f:
+            return [line.strip() for line in f.readlines()]
+
+    trainval_ids = read_image_set("trainval")
+    test_ids = read_image_set("test")
+
+    # 小样本：从 trainval 中随机抽取 num_samples 张图像，保持类别分布均衡
+    if small_mode:
+        print(f"正在进行小样本抽取，目标数量: {num_samples}")
+        random.shuffle(trainval_ids)
+
+        # 统计每张图像的类别分布（粗略统计）
+        img_to_classes = {}
+        for img_id in trainval_ids:
+            anno_file = voc_path / "Annotations" / f"{img_id}.xml"
+            if not anno_file.exists():
                 continue
-            tree = ET.parse(xml_path)
+            from xml.etree import ElementTree as ET
+            tree = ET.parse(anno_file)
+            objs = tree.findall('object')
+            cats = [obj.find('name').text for obj in objs]
+            img_to_classes[img_id] = set(cats)
+
+        # 按类别均衡采样（简单贪心）
+        selected = []
+        quota = {c: max(1, num_samples // len(classes)) for c in classes}
+        remaining = set(trainval_ids)
+        # 先确保每个类别至少有一个样本
+        for c in classes:
+            candidate = None
+            for img_id in list(remaining):
+                if c in img_to_classes.get(img_id, set()):
+                    candidate = img_id
+                    break
+            if candidate:
+                selected.append(candidate)
+                remaining.remove(candidate)
+                quota[c] -= 1
+
+        # 再随机填充其余样本
+        need = num_samples - len(selected)
+        if need > 0:
+            extra = random.sample(list(remaining), min(need, len(remaining)))
+            selected.extend(extra)
+
+        # 划分训练集与验证集（9:1）
+        random.shuffle(selected)
+        split_idx = int(0.9 * len(selected))
+        train_ids = selected[:split_idx]
+        val_ids = selected[split_idx:]
+        print(f"小样本训练集: {len(train_ids)} 张, 验证集: {len(val_ids)} 张")
+    else:
+        # 大样本：使用全部 trainval 作为训练集，验证集使用部分数据（如 10%）
+        train_ids, val_ids = trainval_ids[:-1000], trainval_ids[-1000:]  # 简单划分
+
+    # 创建 YOLO 目录结构
+    for sub in ["images/train", "images/val", "labels/train", "labels/val"]:
+        os.makedirs(Path(yolo_dir) / sub, exist_ok=True)
+
+    # 拷贝图片并生成 YOLO 标签
+    def process_split(ids, split):
+        for img_id in ids:
+            img_path = voc_path / "JPEGImages" / f"{img_id}.jpg"
+            if not img_path.exists():
+                continue
+            # 复制图片
+            dest_img = Path(yolo_dir) / "images" / split / f"{img_id}.jpg"
+            if not dest_img.exists():
+                shutil.copy(img_path, dest_img)
+
+            # 解析 XML 标注并写入 YOLO 格式
+            anno_file = voc_path / "Annotations" / f"{img_id}.xml"
+            if not anno_file.exists():
+                continue
+            tree = ET.parse(anno_file)
             root = tree.getroot()
+            size = root.find('size')
+            width = int(size.find('width').text)
+            height = int(size.find('height').text)
 
-            img_w = int(root.find('size/width').text)
-            img_h = int(root.find('size/height').text)
-
-            yolo_labels = []
+            label_lines = []
             for obj in root.iter('object'):
-                cls_name = obj.find('name').text
-                if cls_name not in VOC_CLASSES:
+                cls = obj.find('name').text
+                if cls not in class_to_id:
                     continue
-                cls_id = VOC_CLASSES.index(cls_name)
+                cls_id = class_to_id[cls]
+                bbox = obj.find('bndbox')
+                xmin = float(bbox.find('xmin').text)
+                ymin = float(bbox.find('ymin').text)
+                xmax = float(bbox.find('xmax').text)
+                ymax = float(bbox.find('ymax').text)
+                # 归一化中心点格式 [cx, cy, w, h]
+                cx = ((xmin + xmax) / 2) / width
+                cy = ((ymin + ymax) / 2) / height
+                w = (xmax - xmin) / width
+                h = (ymax - ymin) / height
+                label_lines.append(f"{cls_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
 
-                xmlbox = obj.find('bndbox')
-                # 获取边界框坐标并转换为YOLO格式
-                x_min = float(xmlbox.find('xmin').text)
-                y_min = float(xmlbox.find('ymin').text)
-                x_max = float(xmlbox.find('xmax').text)
-                y_max = float(xmlbox.find('ymax').text)
+            dest_label = Path(yolo_dir) / "labels" / split / f"{img_id}.txt"
+            with open(dest_label, 'w') as f:
+                f.write("\n".join(label_lines))
 
-                # 计算中心点与宽高，并归一化
-                x_center = (x_min + x_max) / 2.0 / img_w
-                y_center = (y_min + y_max) / 2.0 / img_h
-                w = (x_max - x_min) / img_w
-                h = (y_max - y_min) / img_h
+    process_split(train_ids, "train")
+    process_split(val_ids, "val")
 
-                yolo_labels.append(f"{cls_id} {x_center:.6f} {y_center:.6f} {w:.6f} {h:.6f}")
-
-            # 写入标签文件
-            label_path = os.path.join(label_out_dir, f'{img_id}.txt')
-            with open(label_path, 'w') as f:
-                f.write('\n'.join(yolo_labels))
-
-            # 复制图像文件
-            src_img = os.path.join(voc_root, 'JPEGImages', f'{img_id}.jpg')
-            dst_img = os.path.join(img_out_dir, f'{img_id}.jpg')
-            if os.path.exists(src_img) and not os.path.exists(dst_img):
-                shutil.copy(src_img, dst_img)
-
-    print("VOC到YOLO格式转换完成！")
-
-# ================= 3. 数据集划分：小样本 vs 大样本 =================
-def create_few_shot_dataset(yolo_root, few_shot_root, num_samples=400):
-    """
-    创建小样本数据集（保证类别相对均衡的近似分层抽样）
-    """
-    print(f"开始生成 {num_samples} 张小样本数据集...")
-    src_img_dir = os.path.join(yolo_root, 'images', 'trainval')
-    src_lbl_dir = os.path.join(yolo_root, 'labels', 'trainval')
-
-    dst_img_dir = os.path.join(few_shot_root, 'images', 'trainval')
-    dst_lbl_dir = os.path.join(few_shot_root, 'labels', 'trainval')
-    os.makedirs(dst_img_dir, exist_ok=True)
-    os.makedirs(dst_lbl_dir, exist_ok=True)
-
-    # 🔧 修复1: 只获取 .jpg 图片文件，排除其他非图片文件
-    all_imgs = sorted([f for f in os.listdir(src_img_dir) if f.endswith('.jpg')])
-
-    # 统计每张图包含的类别
-    img_classes = {}
-    for img_name in all_imgs:
-        lbl_path = os.path.join(src_lbl_dir, img_name.replace('.jpg', '.txt'))
-        if os.path.exists(lbl_path):
-            with open(lbl_path, 'r') as f:
-                lines = f.readlines()
-            classes_in_img = set(line.split()[0] for line in lines if line.strip())
-            # 🔧 修复2: 忽略空标签的图片
-            if classes_in_img:
-                img_classes[img_name] = classes_in_img
-
-    # 尝试按类别均衡抽取
-    selected_imgs = set()
-    class_count = {cls: 0 for cls in VOC_CLASSES}
-
-    # 打乱图片顺序以增加随机性
-    random.shuffle(all_imgs)
-
-    for img_name in all_imgs:
-        # 🔧 修复3: 跳过没有标签或标签为空的图片
-        if img_name not in img_classes:
-            continue
-        if len(selected_imgs) >= num_samples:
-            break
-        # 获取当前图片中最稀缺的类别的计数
-        min_cls_count = min(class_count[cls] for cls in img_classes[img_name])
-        # 偏好选取包含稀缺类别的图片
-        if min_cls_count < num_samples / 20 or len(selected_imgs) < num_samples * 0.8:
-            selected_imgs.add(img_name)
-            for cls in img_classes[img_name]:
-                class_count[cls] += 1
-
-    # 复制文件
-    for img_name in selected_imgs:
-        shutil.copy(os.path.join(src_img_dir, img_name), os.path.join(dst_img_dir, img_name))
-        lbl_name = img_name.replace('.jpg', '.txt')
-        lbl_src = os.path.join(src_lbl_dir, lbl_name)
-        if os.path.exists(lbl_src):
-            shutil.copy(lbl_src, os.path.join(dst_lbl_dir, lbl_name))
-
-    # 复制测试集(测试集大小样本实验共用)
-    test_img_dst = os.path.join(few_shot_root, 'images', 'test')
-    test_lbl_dst = os.path.join(few_shot_root, 'labels', 'test')
-    if not os.path.exists(test_img_dst):
-        # 🔧 修复4: 使用 dirs_exist_ok=True 避免中断后重新运行报错
-        shutil.copytree(
-            os.path.join(yolo_root, 'images', 'test'),
-            test_img_dst,
-            dirs_exist_ok=True
-        )
-        shutil.copytree(
-            os.path.join(yolo_root, 'labels', 'test'),
-            test_lbl_dst,
-            dirs_exist_ok=True
-        )
-
-    print(f"小样本数据集生成完成，共抽取 {len(selected_imgs)} 张图像。")
-    return len(selected_imgs)
-
-def create_yaml(yolo_root, dataset_name):
-    """生成Ultralytics需要的data.yaml配置文件"""
-    yaml_path = os.path.join(yolo_root, 'data.yaml')
-    data = {
-        'path': os.path.abspath(yolo_root),
-        'train': 'images/trainval',
-        'val': 'images/test',
-        'test': 'images/test',
-        'names': {i: cls for i, cls in enumerate(VOC_CLASSES)}
+    # 创建 dataset.yaml
+    data_yaml = {
+        'path': str(Path(yolo_dir).absolute()),
+        'train': 'images/train',
+        'val': 'images/val',
+        'names': {i: name for i, name in enumerate(classes)}
     }
-    with open(yaml_path, 'w') as f:
-        yaml.dump(data, f, sort_keys=False)
-    return yaml_path
+    with open(Path(yolo_dir) / "dataset.yaml", 'w') as f:
+        yaml.dump(data_yaml, f)
 
-# ================= 4. 模型训练 =================
-def train_model(yaml_path, exp_name, epochs=EPOCHS_BASE, batch=BATCH_SIZE, lr=LR_BASE):
-    """使用YOLOv11n进行训练"""
-    print(f"\n==== 开始训练实验: {exp_name} ====")
-    # 加载预训练模型，加速收敛并适应小样本
-    model = YOLO('yolo11n.pt')
+    print(f"数据集转换完成，保存至 {yolo_dir}")
+    return str(Path(yolo_dir).absolute())
 
+# -------------------------- 训练与评估 --------------------------
+def train_model(data_yaml, weights, run_name, hyperparams, resume=False):
+    """
+    通用训练函数，支持混合精度、自动保存及断点续训。
+    返回训练好的模型对象。
+    """
+    print(f"\n{'='*40}")
+    print(f"开始训练: {run_name}")
+    print(f"数据集: {data_yaml}")
+    print(f"预训练权重: {weights}")
+    print(f"超参数: {hyperparams}")
+    print(f"Resume: {resume}")
+
+    model = YOLO(weights) if weights else YOLO('yolo11n.pt')  # 默认使用 n 版本
+
+    # 训练参数
     results = model.train(
-        data=yaml_path,
-        epochs=epochs,
-        imgsz=IMGSZ,
-        batch=batch,
-        lr0=lr,
-        device=DEVICE,
-        amp=AMP,           # 混合精度
-        cache=False,       # 2G显存不要开cache，会OOM
-        project=EXPERIMENT_ROOT,
-        name=exp_name,
+        data=data_yaml,
+        epochs=hyperparams['epochs'],
+        batch=hyperparams['batch'],
+        imgsz=hyperparams['imgsz'],
+        lr0=hyperparams['lr0'],
+        optimizer=hyperparams['optimizer'],
+        weight_decay=hyperparams['weight_decay'],
+        momentum=hyperparams['momentum'],
+        warmup_epochs=hyperparams['warmup_epochs'],
+        amp=hyperparams['amp'],
+        workers=hyperparams['workers'],
+        # 如果启用数据增强，传入增强参数
+        **{k: v for k, v in hyperparams.items() if k in ['hsv_h', 'hsv_s', 'hsv_v',
+                                                         'degrees', 'translate', 'scale',
+                                                         'shear', 'flipud', 'fliplr',
+                                                         'mosaic', 'erasing']},
+        resume=resume,
+        project='runs/train',
+        name=run_name,
         exist_ok=True
     )
-    return os.path.join(EXPERIMENT_ROOT, exp_name, 'weights', 'best.pt')
+    return model
 
-# ================= 5. 模型评估：IoU阈值对比 =================
-def evaluate_iou_thresholds(model_path, yaml_path, exp_name):
-    """在不同IoU阈值下评估模型"""
-    print(f"\n==== 评估 IoU 阈值影响: {exp_name} ====")
-    model = YOLO(model_path)
+def evaluate_model(model, data_yaml, iou_thresholds=None, save_txt=True):
+    """
+    使用指定的 IoU 阈值列表评估模型，返回各阈值下的指标字典。
+    """
+    if iou_thresholds is None:
+        iou_thresholds = [0.5]
 
-    iou_thresholds = [0.3, 0.5, 0.7]
-    eval_results = {}
-
+    metrics = {}
     for iou in iou_thresholds:
-        print(f"--- 评估 IoU={iou} ---")
-        metrics = model.val(
-            data=yaml_path,
-            imgsz=IMGSZ,
-            batch=BATCH_SIZE,
-            device=DEVICE,
-            iou=iou,            # NMS的IoU阈值
-            conf=0.001,         # 置信度阈值拉低以计算完整的P-R曲线
+        print(f"\n评估 IoU={iou} ...")
+        results = model.val(
+            data=data_yaml,
+            iou=iou,
             save_json=False,
-            project=EXPERIMENT_ROOT,
-            name=f"{exp_name}_eval_iou{iou}",
+            save_txt=save_txt,
+            project='runs/val',
+            name=f'iou_{iou}',
             exist_ok=True
         )
-        # 记录核心指标
-        eval_results[iou] = {
-            'Precision': metrics.box.mp,    # Mean Precision
-            'Recall': metrics.box.mr,       # Mean Recall
-            'mAP@0.5': metrics.box.map50,   # mAP@0.5
-            'mAP@0.5:0.95': metrics.box.map  # mAP@0.5:0.95
+        metrics[iou] = {
+            'mAP50': results.box.map50,
+            'mAP50_95': results.box.map,
+            'precision': results.box.p[0] if hasattr(results.box, 'p') else None,
+            'recall': results.box.r[0] if hasattr(results.box, 'r') else None
         }
+        print(f"  mAP@0.5: {metrics[iou]['mAP50']:.4f}, mAP@0.5:0.95: {metrics[iou]['mAP50_95']:.4f}")
 
-    # 打印汇总表格
-    print("\n==== IoU阈值对比结果 ====")
-    print(f"{'IoU':<10} {'Precision':<12} {'Recall':<12} {'mAP@0.5':<12} {'mAP@0.5:0.95':<15}")
-    for iou, res in eval_results.items():
-        print(f"{iou:<10} {res['Precision']:<12.4f} {res['Recall']:<12.4f} "
-              f"{res['mAP@0.5']:<12.4f} {res['mAP@0.5:0.95']:<15.4f}")
+    return metrics
 
-    return eval_results
+# -------------------------- 可视化 --------------------------
+def visualize_predictions(model, image_paths, output_dir='outputs/visual', confidence=0.5):
+    """
+    对给定图像进行推理，绘制真实框（从标注文件读取）与预测框的对比图。
+    """
+    os.makedirs(output_dir, exist_ok=True)
 
-# ================= 6. 推理可视化：GT vs Prediction =================
-def visualize_predictions(model_path, yaml_path, exp_name, num_images=5):
-    """可视化真实框与预测框的对比"""
-    print(f"\n==== 推理可视化: {exp_name} ====")
-    model = YOLO(model_path)
-
-    # 🔧 修复5: 简化路径推导，先查yaml所在目录，再fallback到VOC原始目录
-    yaml_dir = os.path.dirname(yaml_path)
-    test_img_dir = os.path.join(yaml_dir, 'images', 'test')
-    test_lbl_dir = os.path.join(yaml_dir, 'labels', 'test')
-
-    if not os.path.isdir(test_img_dir):
-        test_img_dir = os.path.join(VOC_ROOT, 'JPEGImages')
-        test_lbl_dir = os.path.join(YOLO_DATASET_ROOT, 'labels', 'test')
-
-    if not os.path.isdir(test_img_dir):
-        print(f"错误: 找不到测试图片目录! 尝试过: {test_img_dir}")
-        return
-
-    img_list = [f for f in os.listdir(test_img_dir) if f.endswith('.jpg')]
-    if not img_list:
-        print(f"警告: 测试图片目录为空: {test_img_dir}")
-        return
-
-    samples = random.sample(img_list, min(num_images, len(img_list)))
-
-    out_dir = os.path.join(EXPERIMENT_ROOT, exp_name, "visualizations")
-    os.makedirs(out_dir, exist_ok=True)
-
-    for img_name in samples:
-        img_path = os.path.join(test_img_dir, img_name)
+    for img_path in image_paths:
         img = cv2.imread(img_path)
         if img is None:
-            print(f"警告: 无法读取图片 {img_path}，跳过")
+            print(f"无法读取图片: {img_path}")
             continue
         h, w = img.shape[:2]
 
-        # 1. 绘制 GT (绿色)
-        lbl_path = os.path.join(test_lbl_dir, img_name.replace('.jpg', '.txt'))
-        if os.path.exists(lbl_path):
-            with open(lbl_path, 'r') as f:
-                lines = f.readlines()
-            for line in lines:
-                parts = line.strip().split()
-                if len(parts) < 5:
+        # 推理预测
+        results = model(img)
+        pred_boxes = results[0].boxes
+
+        # 绘制真实框：尝试从同名标注文件读取
+        gt_boxes = []
+        label_path = img_path.replace('JPEGImages', 'Annotations').replace('jpg', 'xml')
+        if os.path.exists(label_path):
+            import xml.etree.ElementTree as ET
+            tree = ET.parse(label_path)
+            root = tree.getroot()
+            for obj in root.iter('object'):
+                cls = obj.find('name').text
+                bbox = obj.find('bndbox')
+                xmin = int(float(bbox.find('xmin').text))
+                ymin = int(float(bbox.find('ymin').text))
+                xmax = int(float(bbox.find('xmax').text))
+                ymax = int(float(bbox.find('ymax').text))
+                gt_boxes.append((cls, xmin, ymin, xmax, ymax))
+
+        # 绘制真实框（绿色）
+        for cls, x1, y1, x2, y2 in gt_boxes:
+            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(img, f"GT:{cls}", (x1, y1-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+        # 绘制预测框（红色）
+        if pred_boxes is not None and len(pred_boxes) > 0:
+            for box in pred_boxes:
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                conf = box.conf.item()
+                cls_id = int(box.cls.item())
+                label = f"{model.names[cls_id]}: {conf:.2f}"
+                if conf < confidence:
                     continue
-                cls_id = int(parts[0])
-                x_c, y_c, bw, bh = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
-                # 还原坐标
-                x1 = int((x_c - bw / 2) * w)
-                y1 = int((y_c - bh / 2) * h)
-                x2 = int((x_c + bw / 2) * w)
-                y2 = int((y_c + bh / 2) * h)
-                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)  # Green for GT
-                cv2.putText(img, f"GT:{VOC_CLASSES[cls_id]}", (x1, y1 - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-        # 2. 预测
-        results = model.predict(img_path, imgsz=IMGSZ, conf=0.25, device=DEVICE, verbose=False)
-        res = results[0]
-
-        # 绘制 Prediction (红色)
-        if res.boxes is not None:
-            for box in res.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                conf = box.conf[0].item()
-                cls_id = int(box.cls[0].item())
-                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 2)  # Red for Pred
-                cv2.putText(img, f"{VOC_CLASSES[cls_id]}:{conf:.2f}", (x1, y2 + 15),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 0), 2)
+                cv2.putText(img, label, (int(x1), int(y1)-10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
 
         # 保存结果
-        save_path = os.path.join(out_dir, f"vis_{img_name}")
-        cv2.imwrite(save_path, img)
-        print(f"已保存可视化结果: {save_path}")
+        out_path = os.path.join(output_dir, os.path.basename(img_path))
+        cv2.imwrite(out_path, img)
+        print(f"可视化图片保存至: {out_path}")
 
-# ================= 7. 主控流程 =================
+# -------------------------- 主实验流程 --------------------------
+def main():
+    setup_directories()
+    set_seed(42)
+    check_gpu_memory()
+
+    # 用户选择实验规模
+    print("\n请选择实验模式:")
+    print("1. 小样本实验 (300张训练，符合 2GB 显存)")
+    print("2. 大样本实验 (需要 >2GB 显存，可能 OOM)")
+    choice = input("输入 1 或 2 (默认 1): ").strip() or '1'
+    if choice == '2':
+        small_mode = False
+        cfg = config.LARGE_SAMPLE
+        print("已选择大样本实验，请注意显存！")
+    else:
+        small_mode = True
+        cfg = config.SMALL_SAMPLE
+        print("已选择小样本实验。")
+
+    # 数据预处理（如已存在则跳过）
+    yolo_data_dir = f"datasets/VOC2007_yolo_{'small' if small_mode else 'large'}"
+    if os.path.exists(yolo_data_dir):
+        print(f"数据集目录已存在，跳过转换: {yolo_data_dir}")
+    else:
+        convert_voc_to_yolo(config.DEVKIT_PATH, yolo_data_dir,
+                            small_mode=small_mode, num_samples=cfg.get('num_samples', 300))
+
+    # 准备数据 yaml 路径
+    data_yaml = os.path.join(yolo_data_dir, "dataset.yaml")
+
+    # 检查是否存在训练检查点
+    run_name = f"yolo11n_voc_{'small' if small_mode else 'large'}"
+    last_pt = f"runs/train/{run_name}/weights/last.pt"
+    resume_training = False
+    if os.path.exists(last_pt):
+        print(f"发现上次训练检查点: {last_pt}")
+        ans = input("是否继续上次的训练？(y/n, 默认 y): ").strip().lower() or 'y'
+        resume_training = ans == 'y'
+
+    # 基础训练（YOLOv11n）
+    if resume_training:
+        model = YOLO(last_pt)   # 加载上次最好的模型继续训练
+    else:
+        model = YOLO(config.WEIGHTS_PATH)
+
+    # 训练（如果不需要训练可注释）
+    print("\n开始训练...")
+    model = train_model(data_yaml, config.WEIGHTS_PATH, run_name, cfg, resume=resume_training)
+
+    # 基础评估（IoU=0.5 和 0.5:0.95）
+    print("\n基础评估 (IoU=0.5)...")
+    base_metrics = evaluate_model(model, data_yaml, iou_thresholds=[0.5, 0.95])
+
+    # ---- 实验 1：不同 IoU 阈值对比评估 ----
+    print("\n开始 IoU 阈值对比实验...")
+    iou_metrics = evaluate_model(model, data_yaml, iou_thresholds=config.IOU_THRESHOLDS)
+    # 保存结果到文件
+    with open('outputs/iou_threshold_comparison.txt', 'w') as f:
+        for iou, met in iou_metrics.items():
+            f.write(f"IoU={iou}: mAP@0.5={met['mAP50']:.4f}, mAP@0.5:0.95={met['mAP50_95']:.4f}\n")
+    print("IoU 对比结果已保存至 outputs/iou_threshold_comparison.txt")
+
+    # ---- 实验 2：数据增强策略对比 ----
+    print("\n开始数据增强对比实验...")
+    for aug_name, aug_params in config.AUGMENT_SETTINGS.items():
+        aug_cfg = cfg.copy()
+        aug_cfg.update(aug_params)
+        aug_run = f"{run_name}_aug_{aug_name}"
+        print(f"训练增强策略: {aug_name}")
+        aug_model = train_model(data_yaml, config.WEIGHTS_PATH, aug_run, aug_cfg, resume=False)
+        aug_metrics = evaluate_model(aug_model, data_yaml, iou_thresholds=[0.5])
+        print(f"  增强 {aug_name}  mAP@0.5: {aug_metrics[0.5]['mAP50']:.4f}")
+
+    # ---- 实验 3：模型对比（可选，需下载对应权重） ----
+    print("\n开始模型对比实验（若预训练权重不存在则跳过）...")
+    for model_name, weight_path in config.MODEL_PATHS.items():
+        if not os.path.exists(weight_path):
+            print(f"跳过 {model_name}，权重文件不存在: {weight_path}")
+            continue
+        print(f"训练 {model_name} ...")
+        model_run = f"{model_name}_voc_{'small' if small_mode else 'large'}"
+        m = train_model(data_yaml, weight_path, model_run, cfg, resume=False)
+        m_met = evaluate_model(m, data_yaml, iou_thresholds=[0.5])
+        print(f"  {model_name} mAP@0.5: {m_met[0.5]['mAP50']:.4f}")
+
+    # ---- 可视化典型案例 ----
+    print("\n生成可视化结果...")
+    # 选取测试集中的几张图片
+    test_images = []
+    test_dir = os.path.join(config.DEVKIT_PATH, "VOC2007", "JPEGImages")
+    test_ids_file = os.path.join(config.DEVKIT_PATH, "VOC2007", "ImageSets", "Main", "test.txt")
+    if os.path.exists(test_ids_file):
+        with open(test_ids_file, 'r') as f:
+            test_ids = [line.strip() for line in f.readlines()[:5]]  # 取前5张
+        test_images = [os.path.join(test_dir, f"{img_id}.jpg") for img_id in test_ids]
+    else:
+        print("测试集文件缺失，无法生成可视化。")
+    if test_images:
+        visualize_predictions(model, test_images, output_dir='outputs/visual')
+
+    print("\n所有实验完成！")
+
+# -------------------------- 继续训练说明 --------------------------
+def print_resume_instruction():
+    print("""
+如何继续训练：
+1. 训练过程中会自动在 runs/train/<run_name>/weights/ 目录下保存 last.pt 和 best.pt。
+2. 如果训练被中断（例如由于显存不足、手动停止），重新运行本脚本，会提示是否继续训练。
+3. 选择 'y' 将加载 last.pt 并从中断的 epoch 继续（设置 resume=True）。
+4. 如果希望从最佳检查点继续，可手动修改代码中的权重路径为 best.pt，并设置 resume=False（从该权重初始化训练）。
+    """)
+
 if __name__ == "__main__":
-    import time
-    begin_time = time.time()
-    print(f"实验开始时间: {time.ctime(begin_time)}")
-    print("开始实验")
-
-    # 0. 预备工作
-    random.seed(42)  # 保证实验可复现
-    os.makedirs(EXPERIMENT_ROOT, exist_ok=True)
-
-    time1 = time.time()
-    print(f"预备工作完成，耗时: {time1 - begin_time:.2f} 秒")
-
-    # 1. 数据转换 (仅需运行一次，若已转换则注释掉)
-    if not os.path.exists(YOLO_DATASET_ROOT):
-        convert_voc_to_yolo(VOC_ROOT, YOLO_DATASET_ROOT)
-
-    time2 = time.time()
-    print(f"数据转换完成，耗时: {time2 - time1:.2f} 秒")
-
-    # 2. 生成小样本与完整大样本的YAML配置
-    # 大样本 (Full VOC2007 trainval - 约5000张)
-    full_yaml = create_yaml(YOLO_DATASET_ROOT, "FullDataset")
-
-    # 小样本 (约400张，均衡抽取)
-    few_shot_root = os.path.join(os.path.dirname(YOLO_DATASET_ROOT), "VOC_YOLO_FewShot")
-    if not os.path.exists(few_shot_root):
-        create_few_shot_dataset(YOLO_DATASET_ROOT, few_shot_root, num_samples=400)
-    few_yaml = create_yaml(few_shot_root, "FewShotDataset")
-
-    time3 = time.time()
-    print(f"数据集划分与YAML生成完成，耗时: {time3 - time2:.2f} 秒")
-
-    # =========== 实验一：数据集对比实验 (小样本 vs 大样本) ===========
-    # 训练小样本
-    few_model_path = train_model(few_yaml, exp_name="FewShot_yolo11n", epochs=EPOCHS_BASE, lr=LR_BASE)
-    time4 = time.time()
-    print(f"小样本训练完成，耗时: {time4 - time3:.2f} 秒")
-    # 评估IoU阈值影响
-    evaluate_iou_thresholds(few_model_path, few_yaml, "FewShot_yolo11n")
-    time5 = time.time()
-    print(f"小样本评估完成，耗时: {time5 - time4:.2f} 秒")
-
-    # 训练大样本
-    # full_model_path = train_model(full_yaml, exp_name="FullShot_yolo11n", epochs=EPOCHS_BASE, lr=LR_BASE)
-
-    # 评估IoU阈值影响 (使用大样本模型作为基准)
-    # evaluate_iou_thresholds(full_model_path, full_yaml, "FullShot_yolo11n")
-
-    # =========== 实验二：训练策略实验 (修改超参数) ===========
-    # 降低学习率实验
-    # train_model(full_yaml, exp_name="FullShot_LowLR", epochs=EPOCHS_BASE, lr=0.001)
-    # 增加Epoch实验
-    # train_model(full_yaml, exp_name="FullShot_MoreEpoch", epochs=100, lr=LR_BASE)
-
-    # =========== 实验三：推理可视化 ===========
-    # 选取大样本模型进行可视化
-    # visualize_predictions(full_model_path, full_yaml, "FullShot_yolo11n", num_images=5)
-
-    print("\n====== 所有实验运行完毕！请查看 Experiments 目录下结果 ======")
+    print_resume_instruction()
+    main()
