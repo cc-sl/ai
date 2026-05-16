@@ -4,3 +4,4 @@ runas/
 .gitignore
 photos/
 runs*
+*样本.txt
