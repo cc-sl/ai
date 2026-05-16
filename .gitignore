@@ -3,4 +3,4 @@ experiments/
 runas/
 .gitignore
 photos/
-runs/
+runs*

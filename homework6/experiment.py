@@ -35,6 +35,16 @@ from utils import (
 )
 
 # -------------------------- 数据集预处理 --------------------------
+def _dataset_matches_classes(yolo_dir, expected_classes):
+    """检查已有数据集的 dataset.yaml 是否与当前 VOC_CLASSES 一致"""
+    yaml_path = Path(yolo_dir) / "dataset.yaml"
+    if not yaml_path.exists():
+        return False
+    with open(yaml_path, 'r') as f:
+        data = yaml.safe_load(f)
+    existing_names = list(data.get('names', {}).values())
+    return existing_names == list(expected_classes)
+
 def convert_voc_to_yolo(voc_dir, yolo_dir, small_mode=True, num_samples=300):
     """
     将 VOC 格式标注转换为 YOLO 格式，并创建 dataset.yaml。
@@ -44,21 +54,20 @@ def convert_voc_to_yolo(voc_dir, yolo_dir, small_mode=True, num_samples=300):
     small_mode: 是否启用小样本抽取
     num_samples: 小样本训练集图像数量
     """
+    classes = Config.VOC_CLASSES
     if os.path.exists(yolo_dir) and os.path.exists(os.path.join(yolo_dir, "dataset.yaml")):
-        print(f"YOLO 数据集已存在，跳过转换: {yolo_dir}")
-        return yolo_dir
+        if _dataset_matches_classes(yolo_dir, classes):
+            print(f"YOLO 数据集已存在且类别匹配，跳过转换: {yolo_dir}")
+            return yolo_dir
+        else:
+            print(f"检测到 VOC_CLASSES 已变化，删除旧数据集并重新生成...")
+            shutil.rmtree(yolo_dir)
 
     voc_path = Path(voc_dir) / "VOC2007"
     if not voc_path.exists():
         raise FileNotFoundError(f"VOC 数据集未找到: {voc_path}")
 
-    # 解析类别名称
-    classes = [
-        "aeroplane", "bicycle", "bird", "boat", "bottle",
-        "bus", "car", "cat", "chair", "cow",
-        "diningtable", "dog", "horse", "motorbike", "person",
-        "pottedplant", "sheep", "sofa", "train", "tvmonitor"
-    ]
+    # 构建类别名称到ID的映射（基于当前 Config.VOC_CLASSES）
     class_to_id = {name: idx for idx, name in enumerate(classes)}
 
     # 读取官方划分
@@ -83,11 +92,17 @@ def convert_voc_to_yolo(voc_dir, yolo_dir, small_mode=True, num_samples=300):
             anno_file = voc_path / "Annotations" / f"{img_id}.xml"
             if not anno_file.exists():
                 continue
-            from xml.etree import ElementTree as ET
+            import xml.etree.ElementTree as ET
             tree = ET.parse(anno_file)
             objs = tree.findall('object')
             cats = [obj.find('name').text for obj in objs]
             img_to_classes[img_id] = set(cats)
+
+        # 新增：过滤掉不含任何目标类别的图片
+        retained_set = set(classes)
+        trainval_ids = [img_id for img_id in trainval_ids
+                        if img_to_classes.get(img_id, set()) & retained_set]
+        print(f"类别缩减为 {len(classes)} 类，过滤后剩余 {len(trainval_ids)} 张有效图片")
 
         # 按类别均衡采样（简单贪心）
         selected = []
@@ -111,9 +126,9 @@ def convert_voc_to_yolo(voc_dir, yolo_dir, small_mode=True, num_samples=300):
             extra = random.sample(list(remaining), min(need, len(remaining)))
             selected.extend(extra)
 
-        # 划分训练集与验证集（9:1）
+        # 划分训练集与验证集（8:2）
         random.shuffle(selected)
-        split_idx = int(0.9 * len(selected))
+        split_idx = int(0.8 * len(selected))
         train_ids = selected[:split_idx]
         val_ids = selected[split_idx:]
         print(f"小样本训练集: {len(train_ids)} 张, 验证集: {len(val_ids)} 张")
@@ -126,6 +141,8 @@ def convert_voc_to_yolo(voc_dir, yolo_dir, small_mode=True, num_samples=300):
         os.makedirs(Path(yolo_dir) / sub, exist_ok=True)
 
     # 拷贝图片并生成 YOLO 标签
+    import xml.etree.ElementTree as ET
+
     def process_split(ids, split):
         for img_id in ids:
             img_path = voc_path / "JPEGImages" / f"{img_id}.jpg"
@@ -210,10 +227,15 @@ def train_model(data_yaml, weights, run_name, hyperparams, resume=False, retry_w
             workers=hyperparams['workers'],
             resume=resume,
             project='runs/train',
-            patience=10,
+            # patience=10,
             name=run_name,
             exist_ok=True,
             plots=False,
+            #question
+            **{k: v for k, v in hyperparams.items() if k in [
+                'hsv_h','hsv_s','hsv_v','degrees','translate','scale',
+                'shear','flipud','fliplr','mosaic','erasing'
+            ]}
         )
 
         #  使用 ultralytics 实际保存的目录，而不是自己拼接
@@ -291,7 +313,7 @@ def visualize_predictions(model, image_paths, output_dir='outputs/visual', confi
         results = model(img)
         pred_boxes = results[0].boxes
 
-        # 绘制真实框：尝试从同名标注文件读取
+        # 绘制真实框：尝试从同名标注文件读取，只绘制 Config.VOC_CLASSES 中的类别
         gt_boxes = []
         label_path = img_path.replace('JPEGImages', 'Annotations').replace('jpg', 'xml')
         if os.path.exists(label_path):
@@ -300,6 +322,8 @@ def visualize_predictions(model, image_paths, output_dir='outputs/visual', confi
             root = tree.getroot()
             for obj in root.iter('object'):
                 cls = obj.find('name').text
+                if cls not in Config.VOC_CLASSES:   # 只保留指定类别的真实框
+                    continue
                 bbox = obj.find('bndbox')
                 xmin = int(float(bbox.find('xmin').text))
                 ymin = int(float(bbox.find('ymin').text))
@@ -351,13 +375,10 @@ def main():
         cfg = config.SMALL_SAMPLE
         print("已选择小样本实验。")
 
-    # 数据预处理（如已存在则跳过）
+    # 数据预处理（convert_voc_to_yolo 内部会检测是否需要重建）
     yolo_data_dir = f"datasets/VOC2007_yolo_{'small' if small_mode else 'large'}"
-    if os.path.exists(yolo_data_dir):
-        print(f"数据集目录已存在，跳过转换: {yolo_data_dir}")
-    else:
-        convert_voc_to_yolo(config.DEVKIT_PATH, yolo_data_dir,
-                            small_mode=small_mode, num_samples=cfg.get('num_samples', 300))
+    convert_voc_to_yolo(config.DEVKIT_PATH, yolo_data_dir,
+                        small_mode=small_mode, num_samples=cfg.get('num_samples', 300))
 
     # 准备数据 yaml 路径
     data_yaml = os.path.join(yolo_data_dir, "dataset.yaml")

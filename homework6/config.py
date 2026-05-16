@@ -8,35 +8,6 @@ class Config:
     DEVKIT_PATH = Path("./VOCdevkit")
     WEIGHTS_PATH = Path("./yolo11n.pt")
     # 小样本参数（最大 2GB 显存）
-    # SMALL_SAMPLE = {
-    #     'num_samples': 300,          # 抽取 300 张作为训练集
-    #     'epochs': 50,
-    #     'batch': 4,                  # MX450 2GB 建议 batch=4
-    #     'imgsz': 640,
-    #     #'lr0': 0.01,                 # 初始学习率
-    #     'lr0': 0.001,
-    #     'optimizer': 'SGD',
-    #     'weight_decay': 0.0005,
-    #     'momentum': 0.937,
-    #     'warmup_epochs': 3,
-    #     'amp': True,                 # 混合精度训练
-    #     'workers': 4,
-    #     'data_augment': 'default',   # 使用默认增强
-    # }
-    # SMALL_SAMPLE = {
-    #     'num_samples': 300,
-    #     'epochs': 50,
-    #     'batch': 4,          # 可尝试保持
-    #     'imgsz': 416,        # 关键降低
-    #     'lr0': 0.001,        # 降低学习率
-    #     'optimizer': 'SGD',
-    #     'weight_decay': 0.0005,
-    #     'momentum': 0.937,
-    #     'warmup_epochs': 3,
-    #     'amp': True,
-    #     'workers': 1,        # 减少内存压力
-    #     'data_augment': 'default',
-    # }
 
     SMALL_SAMPLE = {
         'num_samples': 300,
@@ -67,6 +38,15 @@ class Config:
         'workers': 4,
         'data_augment': 'default',
     }
+
+    # VOC_CLASSES = [
+    #     "aeroplane", "bicycle", "bird", "boat", "bottle",
+    #     "bus", "car", "cat", "chair", "cow",
+    #     "diningtable", "dog", "horse", "motorbike", "person",
+    #     "pottedplant", "sheep", "sofa", "train", "tvmonitor"
+    # ]
+    VOC_CLASSES = ["car","cat","person"] 
+
     # 数据增强对比实验参数
     AUGMENT_SETTINGS = {
         'none': {
