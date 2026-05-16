@@ -20,12 +20,12 @@ from typing import Dict, List, Tuple
 import torch
 from ultralytics import YOLO
 
-# -------------------------- 配置文件 --------------------------
+# -- 配置文件 --
 
 from config import Config
 config = Config()
 
-# -------------------------- 工具函数 --------------------------
+# -- 工具函数 --
 
 from utils import (
     setup_directories,
@@ -34,7 +34,7 @@ from utils import (
     check_file_exists
 )
 
-# -------------------------- 数据集预处理 --------------------------
+# -- 数据集预处理 --
 def _dataset_matches_classes(yolo_dir, expected_classes):
     """检查已有数据集的 dataset.yaml 是否与当前 VOC_CLASSES 一致"""
     yaml_path = Path(yolo_dir) / "dataset.yaml"
@@ -201,7 +201,7 @@ def convert_voc_to_yolo(voc_dir, yolo_dir, small_mode=True, num_samples=300):
     print(f"数据集转换完成，保存至 {yolo_dir}")
     return str(Path(yolo_dir).absolute())
 
-# -------------------------- 训练与评估 --------------------------
+# -- 训练与评估 --
 import os
 from ultralytics import YOLO  # 确保导入依赖
 
@@ -295,7 +295,7 @@ def evaluate_model(model, data_yaml, iou_thresholds=None, save_txt=True):
 
     return metrics
 
-# -------------------------- 可视化 --------------------------
+# -- 可视化 --
 def visualize_predictions(model, image_paths, output_dir='outputs/visual', confidence=0.5):
     """
     对给定图像进行推理，绘制真实框（从标注文件读取）与预测框的对比图。
@@ -355,7 +355,7 @@ def visualize_predictions(model, image_paths, output_dir='outputs/visual', confi
         cv2.imwrite(out_path, img)
         print(f"可视化图片保存至: {out_path}")
 
-# -------------------------- 主实验流程 --------------------------
+# -- 主实验流程 --
 def main():
     setup_directories()
     set_seed(42)
@@ -406,7 +406,7 @@ def main():
     print("\n基础评估 (IoU=0.5)...")
     base_metrics = evaluate_model(model, data_yaml, iou_thresholds=[0.5, 0.95])
 
-    # ---- 实验 1：不同 IoU 阈值对比评估 ----
+    #  实验 1：不同 IoU 阈值对比评估 
     print("\n开始 IoU 阈值对比实验...")
     iou_metrics = evaluate_model(model, data_yaml, iou_thresholds=config.IOU_THRESHOLDS)
     # 保存结果到文件
@@ -415,7 +415,7 @@ def main():
             f.write(f"IoU={iou}: mAP@0.5={met['mAP50']:.4f}, mAP@0.5:0.95={met['mAP50_95']:.4f}\n")
     print("IoU 对比结果已保存至 outputs/iou_threshold_comparison.txt")
 
-    # ---- 实验 2：数据增强策略对比 ----
+    #  实验 2：数据增强策略对比 
     print("\n开始数据增强对比实验...")
     for aug_name, aug_params in config.AUGMENT_SETTINGS.items():
         aug_cfg = cfg.copy()
@@ -426,7 +426,7 @@ def main():
         aug_metrics = evaluate_model(aug_model, data_yaml, iou_thresholds=[0.5])
         print(f"  增强 {aug_name}  mAP@0.5: {aug_metrics[0.5]['mAP50']:.4f}")
 
-    # ---- 实验 3：模型对比（可选，需下载对应权重） ----
+    #  实验 3：模型对比（可选，需下载对应权重） 
     print("\n开始模型对比实验（若预训练权重不存在则跳过）...")
     for model_name, weight_path in config.MODEL_PATHS.items():
         if not os.path.exists(weight_path):
@@ -438,7 +438,7 @@ def main():
         m_met = evaluate_model(m, data_yaml, iou_thresholds=[0.5])
         print(f"  {model_name} mAP@0.5: {m_met[0.5]['mAP50']:.4f}")
 
-    # ---- 可视化典型案例 ----
+    #  可视化典型案例 
     print("\n生成可视化结果...")
     # 选取测试集中的几张图片
     test_images = []
@@ -455,7 +455,7 @@ def main():
 
     print("\n所有实验完成！")
 
-# -------------------------- 继续训练说明 --------------------------
+# -- 继续训练说明 --
 def print_resume_instruction():
     print("""
 如何继续训练：

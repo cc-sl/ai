@@ -39,13 +39,13 @@ class Config:
         'data_augment': 'default',
     }
 
-    # VOC_CLASSES = [
-    #     "aeroplane", "bicycle", "bird", "boat", "bottle",
-    #     "bus", "car", "cat", "chair", "cow",
-    #     "diningtable", "dog", "horse", "motorbike", "person",
-    #     "pottedplant", "sheep", "sofa", "train", "tvmonitor"
-    # ]
-    VOC_CLASSES = ["car","cat","person"] 
+    VOC_CLASSES = [
+        "aeroplane", "bicycle", "bird", "boat", "bottle",
+        "bus", "car", "cat", "chair", "cow",
+        "diningtable", "dog", "horse", "motorbike", "person",
+        "pottedplant", "sheep", "sofa", "train", "tvmonitor"
+    ]
+    # VOC_CLASSES = ["car","cat","person"] 
 
     # 数据增强对比实验参数
     AUGMENT_SETTINGS = {
