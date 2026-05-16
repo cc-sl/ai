@@ -48,7 +48,7 @@ class Config:
         'weight_decay': 0.0005,
         'momentum': 0.937,
         'warmup_epochs': 2,     #  3 → 2
-        'amp': True,
+        'amp': False,
         'workers': 2,           #  1 → 2
         'data_augment': 'default',
     }

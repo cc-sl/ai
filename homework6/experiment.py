@@ -364,7 +364,7 @@ def main():
 
     # 检查是否存在训练检查点
     run_name = f"yolo11n_voc_{'small' if small_mode else 'large'}"
-    last_pt = f"runs/train/{run_name}/weights/last.pt"
+    last_pt = f"runs/detect/runs/train/{run_name}/weights/last.pt"
     resume_training = False
     if os.path.exists(last_pt):
         print(f"发现上次训练检查点: {last_pt}")
@@ -438,7 +438,7 @@ def main():
 def print_resume_instruction():
     print("""
 如何继续训练：
-1. 训练过程中会自动在 runs/train/<run_name>/weights/ 目录下保存 last.pt 和 best.pt。
+1. 训练过程中会自动在 runs/detect/runs/train/<run_name>/weights/ 目录下保存 last.pt 和 best.pt。
 2. 如果训练被中断（例如由于显存不足、手动停止），重新运行本脚本，会提示是否继续训练。
 3. 选择 'y' 将加载 last.pt 并从中断的 epoch 继续（设置 resume=True）。
 4. 如果希望从最佳检查点继续，可手动修改代码中的权重路径为 best.pt，并设置 resume=False（从该权重初始化训练）。
