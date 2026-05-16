@@ -444,6 +444,23 @@ def print_resume_instruction():
 4. 如果希望从最佳检查点继续，可手动修改代码中的权重路径为 best.pt，并设置 resume=False（从该权重初始化训练）。
     """)
 
+class Logger:
+    def __init__(self, filename):
+        self.terminal = sys.stdout
+        self.log = open(filename, "w", encoding="utf-8")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.terminal.flush()
+        self.log.flush()
+
+    def flush(self):
+        pass
+    
 if __name__ == "__main__":
+
+    # 使用
+    sys.stdout = Logger("train_log.txt")
     print_resume_instruction()
     main()
